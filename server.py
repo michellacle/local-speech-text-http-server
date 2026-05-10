@@ -8,11 +8,13 @@ Supports:
 Auto-detects hardware at startup and picks the best backend.
 """
 
+import asyncio
 import io
 import json
 import logging
 import os
 import platform
+import subprocess
 import tempfile
 import time
 from contextlib import asynccontextmanager
@@ -22,11 +24,42 @@ import numpy as np
 import soundfile as sf
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import Response
+from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel, Field
 
-logging.basicConfig(level=logging.INFO)
+# In-memory log buffer (last 1000 lines)
+LOG_BUFFER: list[str] = []
+MAX_LOG_LINES = 1000
+
+
+class LogBufferHandler(logging.Handler):
+    """Custom logging handler that buffers log lines in memory."""
+
+    def emit(self, record):
+        try:
+            log_line = self.format(record)
+            LOG_BUFFER.append(log_line)
+            if len(LOG_BUFFER) > MAX_LOG_LINES:
+                LOG_BUFFER.pop(0)
+        except Exception:
+            pass
+
+
+# Set up logging with both console and buffer handlers
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
+
+buffer_handler = LogBufferHandler()
+buffer_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+
 logger = logging.getLogger("tts-server")
+logger.setLevel(logging.INFO)
+logger.addHandler(console_handler)
+logger.addHandler(buffer_handler)
+
+# Also capture uvicorn access logs
+uvicorn_logger = logging.getLogger("uvicorn.access")
+uvicorn_logger.addHandler(buffer_handler)
 
 SAMPLE_RATE = 24000
 
@@ -230,6 +263,169 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Kokoro TTS + Whisper STT", lifespan=lifespan)
+
+
+# ---------------------------------------------------------------------------
+# Home page & observability endpoints
+# ---------------------------------------------------------------------------
+
+HOME_PAGE_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TTS/STT Server</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: 'Segoe UI', system-ui, sans-serif; background: #0d1117; color: #c9d1d9; padding: 20px; }
+        h1 { font-size: 1.8rem; margin-bottom: 8px; color: #58a6ff; }
+        h2 { font-size: 1.2rem; margin-bottom: 12px; color: #58a6ff; border-bottom: 1px solid #30363d; padding-bottom: 6px; }
+        .subtitle { color: #8b949e; margin-bottom: 24px; font-size: 0.9rem; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(400px, 1fr)); gap: 20px; margin-bottom: 24px; }
+        .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; }
+        .card.full { grid-column: 1 / -1; }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid #21262d; }
+        th { color: #8b949e; font-weight: 600; font-size: 0.85rem; }
+        td { font-size: 0.9rem; }
+        .badge { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 0.75rem; font-weight: 600; }
+        .badge-green { background: #123325; color: #3fb950; }
+        .badge-yellow { background: #3d2e00; color: #d29922; }
+        .badge-red { background: #3d1214; color: #f85149; }
+        .badge-blue { background: #0c2d6b; color: #58a6ff; }
+        #log-container { max-height: 400px; overflow-y: auto; font-family: 'Cascadia Code', 'Fira Code', monospace; font-size: 0.8rem; line-height: 1.6; background: #0d1117; border: 1px solid #30363d; border-radius: 6px; padding: 12px; }
+        #log-container div { white-space: pre-wrap; word-break: break-all; }
+        #nvidia-smi { max-height: 400px; overflow-y: auto; font-family: 'Cascadia Code', 'Fira Code', monospace; font-size: 0.8rem; line-height: 1.4; background: #0d1117; border: 1px solid #30363d; border-radius: 6px; padding: 12px; white-space: pre-wrap; word-break: break-all; }
+        .refresh-btn { background: #21262d; border: 1px solid #30363d; color: #c9d1d9; padding: 6px 14px; border-radius: 6px; cursor: pointer; font-size: 0.85rem; margin-bottom: 12px; }
+        .refresh-btn:hover { background: #30363d; }
+        a { color: #58a6ff; text-decoration: none; }
+        a:hover { text-decoration: underline; }
+        code { background: #1c2128; padding: 2px 6px; border-radius: 4px; font-size: 0.85rem; }
+    </style>
+</head>
+<body>
+    <h1>Kokoro TTS + Whisper STT Server</h1>
+    <p class="subtitle">OpenAI-compatible API endpoints</p>
+
+    <div class="grid">
+        <div class="card">
+            <h2>API Endpoints</h2>
+            <table>
+                <tr><th>Method</th><th>Endpoint</th><th>Description</th></tr>
+                <tr><td><span class="badge badge-green">POST</span></td><td><code>/v1/audio/speech</code></td><td>Text-to-speech (Kokoro)</td></tr>
+                <tr><td><span class="badge badge-green">POST</span></td><td><code>/v1/audio/transcriptions</code></td><td>Speech-to-text (Whisper)</td></tr>
+                <tr><td><span class="badge badge-blue">GET</span></td><td><code>/v1/models</code></td><td>List available models</td></tr>
+                <tr><td><span class="badge badge-blue">GET</span></td><td><code>/v1/audio/voices</code></td><td>List available voices</td></tr>
+                <tr><td><span class="badge badge-blue">GET</span></td><td><code>/health</code></td><td>Health check</td></tr>
+                <tr><td><span class="badge badge-blue">GET</span></td><td><code>/api/logs</code></td><td>Last 100 log lines (JSON)</td></tr>
+                <tr><td><span class="badge badge-blue">GET</span></td><td><code>/api/nvidia-smi</code></td><td>GPU status (JSON)</td></tr>
+            </table>
+        </div>
+
+        <div class="card">
+            <h2>Loaded Models</h2>
+            <table id="models-table">
+                <tr><th>Model</th><th>Backend</th><th>Device</th><th>Status</th></tr>
+            </table>
+        </div>
+
+        <div class="card">
+            <h2>Available Voices (OpenAI Mapped)</h2>
+            <table id="voices-table">
+                <tr><th>OpenAI Name</th><th>Kokoro Voice</th></tr>
+            </table>
+        </div>
+
+        <div class="card">
+            <h2>GPU Status (nvidia-smi)</h2>
+            <button class="refresh-btn" onclick="fetchNvidiaSmi()">Refresh</button>
+            <div id="nvidia-smi">Loading...</div>
+        </div>
+
+        <div class="card full">
+            <h2>Service Logs (Last 100 Lines)</h2>
+            <button class="refresh-btn" onclick="fetchLogs()">Refresh</button>
+            <div id="log-container">Loading...</div>
+        </div>
+    </div>
+
+    <script>
+        async function fetchHealth() {
+            const r = await fetch('/health');
+            const d = await r.json();
+            const modelsTable = document.getElementById('models-table');
+            const statusClass = (s) => s === 'ok' ? 'badge-green' : s === 'none' ? 'badge-red' : 'badge-yellow';
+            modelsTable.innerHTML = `
+                <tr><th>Model</th><th>Backend</th><th>Device</th><th>Status</th></tr>
+                <tr><td>Kokoro TTS</td><td>${d.tts_backend}</td><td>${d.tts_device}</td><td><span class="badge badge-green">active</span></td></tr>
+                <tr><td>Whisper STT</td><td>${d.stt_backend}</td><td>${d.stt_device || 'N/A'}</td><td><span class="badge ${statusClass(d.stt_backend)}">${d.stt_backend}</span></td></tr>
+            `;
+        }
+
+        async function fetchVoices() {
+            const r = await fetch('/v1/audio/voices');
+            const d = await r.json();
+            const table = document.getElementById('voices-table');
+            let html = '<tr><th>OpenAI Name</th><th>Kokoro Voice</th></tr>';
+            for (const [k, v] of Object.entries(d.openai_mapped)) {
+                html += `<tr><td>${k}</td><td>${v}</td></tr>`;
+            }
+            table.innerHTML = html;
+        }
+
+        async function fetchLogs() {
+            const r = await fetch('/api/logs');
+            const d = await r.json();
+            const container = document.getElementById('log-container');
+            container.innerHTML = d.logs.map(l => '<div>' + l.replace(/</g, '&lt;').replace(/>/g, '&gt;') + '</div>').join('');
+            container.scrollTop = container.scrollHeight;
+        }
+
+        async function fetchNvidiaSmi() {
+            const r = await fetch('/api/nvidia-smi');
+            const d = await r.json();
+            const el = document.getElementById('nvidia-smi');
+            el.textContent = d.output || d.error || 'nvidia-smi not available';
+        }
+
+        // Initial load
+        Promise.all([fetchHealth(), fetchVoices(), fetchLogs(), fetchNvidiaSmi()]);
+
+        // Auto-refresh logs and nvidia-smi every 5s
+        setInterval(fetchLogs, 5000);
+        setInterval(fetchNvidiaSmi, 5000);
+    </script>
+</body>
+</html>
+"""
+
+
+@app.get("/", response_class=HTMLResponse)
+async def home_page():
+    """Home page with endpoints, models, logs, and GPU status."""
+    return HOME_PAGE_HTML
+
+
+@app.get("/api/logs")
+async def get_logs():
+    """Return the last 100 log lines."""
+    return {"logs": LOG_BUFFER[-100:]}
+
+
+@app.get("/api/nvidia-smi")
+async def get_nvidia_smi():
+    """Run nvidia-smi and return the output."""
+    try:
+        result = await asyncio.wait_for(
+            asyncio.to_thread(subprocess.run, ["nvidia-smi"], capture_output=True, text=True, timeout=10),
+            timeout=12
+        )
+        return {"output": result.stdout}
+    except FileNotFoundError:
+        return {"error": "nvidia-smi not found (no NVIDIA driver installed)"}
+    except Exception as e:
+        return {"error": str(e)}
 
 
 # ---------------------------------------------------------------------------
