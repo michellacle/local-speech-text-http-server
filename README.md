@@ -1,4 +1,4 @@
-# local speech <--> text API server
+# local speech-text API server
 
 > **Alpha Release** — This project is under active development. APIs and configuration may change between versions.
 
