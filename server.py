@@ -8,6 +8,10 @@ Supports:
 GPU is mandatory: the server detects CUDA (NVIDIA) or Metal (Apple
 Silicon) at startup and refuses to start on CPU. There is no CPU
 fallback — a missing/broken GPU is a fatal startup error.
+
+At request time the GPU is re-probed (a GPU can crash or lock up while
+the server is running). If the GPU is not usable at that moment, API
+requests fail fast with HTTP 500 — they never silently degrade to CPU.
 """
 
 import asyncio
@@ -18,6 +22,7 @@ import os
 import platform
 import subprocess
 import tempfile
+import threading
 import time
 from contextlib import asynccontextmanager
 from typing import Literal, Optional
@@ -26,7 +31,7 @@ import numpy as np
 import soundfile as sf
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import HTMLResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel, Field
 
 # In-memory log buffer (last 1000 lines)
@@ -191,6 +196,77 @@ def detect_stt_backend() -> tuple:
         "No GPU available for STT (need NVIDIA CUDA or Apple MLX). "
         "This server is GPU-only and refuses to run on CPU."
     )
+
+
+# ---------------------------------------------------------------------------
+# Runtime GPU health (fail fast at request time — no CPU fallback)
+# ---------------------------------------------------------------------------
+
+# A GPU can crash or lock up while the server is running (driver errors,
+# Xid faults, thermal resets). CUDA calls against a wedged GPU block
+# indefinitely, so the probe below runs in a daemon thread with a hard
+# timeout: a stuck GPU fails fast (within GPU_PROBE_TIMEOUT seconds)
+# instead of hanging the request, and we never fall back to CPU.
+GPU_PROBE_TIMEOUT = float(os.environ.get("GPU_PROBE_TIMEOUT", "5"))
+
+
+def gpu_healthy(timeout: float = GPU_PROBE_TIMEOUT) -> tuple:
+    """Check *right now* whether the GPU is usable.
+
+    Returns (ok, reason). The CUDA probe runs a tiny kernel + full
+    device synchronize in a daemon thread and joins it for at most
+    `timeout` seconds. If the thread is still alive after the timeout,
+    the GPU is wedged. (The stuck probe thread is left behind — one per
+    failed probe; the service is degraded anyway and needs a restart.)
+    """
+    try:
+        import torch
+    except ImportError as e:
+        return False, f"PyTorch not installed: {e}"
+
+    if TTS_DEVICE == "cuda":
+        if not torch.cuda.is_available():
+            return False, (
+                "torch.cuda.is_available() is False — GPU unavailable "
+                "(driver crash or reset?). Restart the service."
+            )
+        res: dict = {}
+
+        def probe():
+            try:
+                dev = f"cuda:{GPU_DEVICE_INDEX}"
+                x = torch.zeros(8, device=dev)
+                x.sum().item()  # launch a kernel + sync
+                torch.cuda.synchronize()
+                res["ok"] = True
+            except Exception as e:  # surface the actual CUDA error
+                res["err"] = str(e)
+
+        t = threading.Thread(target=probe, daemon=True)
+        t.start()
+        t.join(timeout)
+        if t.is_alive():
+            return False, (
+                f"CUDA probe timed out after {timeout:.0f}s — GPU appears "
+                "wedged/locked (Xid error or driver hang). Restart the service."
+            )
+        if "err" in res:
+            return False, f"CUDA probe failed: {res['err']}"
+        return True, ""
+
+    if TTS_DEVICE == "mps":
+        ok = torch.backends.mps.is_available()
+        return (ok, "") if ok else (False, "MPS backend unavailable")
+
+    return False, "No GPU device was detected at startup"
+
+
+def require_gpu() -> None:
+    """Raise HTTP 500 if the GPU is not usable at this moment (fail fast)."""
+    ok, reason = gpu_healthy()
+    if not ok:
+        logger.error(f"GPU unavailable — failing request: {reason}")
+        raise HTTPException(status_code=500, detail=f"GPU unavailable: {reason}")
 
 
 # ---------------------------------------------------------------------------
@@ -502,20 +578,31 @@ def lang_code_for_voice(voice: str) -> str:
 async def create_speech(req: SpeechRequest):
     if not req.input.strip():
         raise HTTPException(status_code=400, detail="Input text must not be empty.")
-    
+
+    require_gpu()  # fail fast with 500 if the GPU crashed/locked up since startup
+
     voice = resolve_voice(req.voice)
     lang_code = lang_code_for_voice(voice)
     pipeline = get_pipeline(lang_code)
-    
+
     logger.info(
         f"TTS: voice={voice} lang={lang_code} speed={req.speed} "
         f"fmt={req.response_format} chars={len(req.input)}"
     )
-    
+
     t0 = time.perf_counter()
     chunks = []
-    for _gs, _ps, audio in pipeline(req.input, voice=voice, speed=req.speed):
-        chunks.append(audio)
+    try:
+        for _gs, _ps, audio in pipeline(req.input, voice=voice, speed=req.speed):
+            chunks.append(audio)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("TTS synthesis failed (GPU error?)")
+        raise HTTPException(
+            status_code=500,
+            detail=f"TTS synthesis failed (GPU unavailable or crashed): {e}",
+        ) from e
     
     if not chunks:
         raise HTTPException(status_code=500, detail="No audio generated.")
@@ -546,15 +633,26 @@ async def create_transcription(
 ):
     if whisper_backend == "none" or (whisper_backend == "cuda" and whisper_model is None):
         raise HTTPException(status_code=503, detail=f"STT backend '{whisper_backend}' not loaded.")
-    
+
+    require_gpu()  # fail fast with 500 if the GPU crashed/locked up since startup
+
     suffix = os.path.splitext(file.filename or ".wav")[1]
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
     try:
         tmp.write(await file.read())
         tmp.close()
-        
+
         t0 = time.perf_counter()
-        text, info = transcribe_audio(tmp.name, language=language)
+        try:
+            text, info = transcribe_audio(tmp.name, language=language)
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.exception("STT transcription failed (GPU error?)")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Transcription failed (GPU unavailable or crashed): {e}",
+            ) from e
         elapsed = time.perf_counter() - t0
         
         logger.info(
@@ -614,9 +712,14 @@ async def list_models():
 
 @app.get("/health")
 async def health():
-    """Healthcheck — reports which backends are active (real devices)."""
-    return {
-        "status": "ok",
+    """Healthcheck — reports which backends are active (real devices).
+
+    Returns 500 when the GPU is not usable at this moment, so monitors
+    (systemd, load balancers, cron) can trigger a service restart.
+    """
+    gpu_ok, gpu_detail = gpu_healthy()
+    payload = {
+        "status": "ok" if gpu_ok else "gpu-unavailable",
         "tts_backend": "kokoro-pytorch",
         "tts_device": TTS_DEVICE or "uninitialized",
         "stt_backend": whisper_backend,
@@ -624,7 +727,11 @@ async def health():
         "stt_device": {"cuda": "nvidia-gpu", "mlx": "apple-silicon"}.get(
             whisper_backend, "unknown"
         ),
+        "gpu": {"available": gpu_ok, "detail": gpu_detail or "healthy"},
     }
+    if not gpu_ok:
+        return JSONResponse(status_code=500, content=payload)
+    return payload
 
 
 if __name__ == "__main__":
