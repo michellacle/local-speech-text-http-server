@@ -1,11 +1,13 @@
-"""OpenAI-compatible TTS/STT server with cross-platform backend support.
+"""OpenAI-compatible TTS/STT server (GPU-only).
 
 Supports:
-- Kokoro TTS (PyTorch — works on CPU, MPS/Apple Silicon, CUDA)
+- Kokoro TTS (PyTorch — CUDA on NVIDIA, MPS on Apple Silicon)
 - faster-whisper STT (CUDA on NVIDIA GPUs)
-- mlx-whisper STT (Apple Silicon / MLX)
+- mlx-whisper STT (Apple Silicon / Metal)
 
-Auto-detects hardware at startup and picks the best backend.
+GPU is mandatory: the server detects CUDA (NVIDIA) or Metal (Apple
+Silicon) at startup and refuses to start on CPU. There is no CPU
+fallback — a missing/broken GPU is a fatal startup error.
 """
 
 import asyncio
@@ -98,89 +100,97 @@ CONTENT_TYPES = {
 # Backend dispatch
 pipelines: dict = {}
 
+# GPU device for Kokoro TTS ('cuda' or 'mps'), set at startup.
+# This server is GPU-only: startup fails hard if no GPU is found.
+TTS_DEVICE: str = ""
+GPU_DEVICE_INDEX = int(os.environ.get("GPU_DEVICE_INDEX", "0"))
+
 # STT backends (populated at startup)
-# On NVIDIA: whisper_model = faster_whisper.WhisperModel
-# On Apple Silicon (MLX): whisper_stt = mlx_whisper module
-whisper_backend = "none"  # 'cuda', 'mlx', 'cpu', or 'none'
-whisper_model = None  # faster_whisper.WhisperModel (CUDA/CPU)
-ml_stt = None  # mlx_stt object (Apple Silicon)
+# On NVIDIA: whisper_model = faster_whisper.WhisperModel (CUDA)
+# On Apple Silicon (MLX): ml_stt = mlx_whisper module
+whisper_backend = "none"  # 'cuda', 'mlx', or 'none'
+whisper_model = None  # faster_whisper.WhisperModel (CUDA)
+ml_stt = None  # mlx_whisper module (Apple Silicon)
 
 
 # ---------------------------------------------------------------------------
-# Hardware detection
+# Hardware detection (GPU-only — no CPU fallback)
 # ---------------------------------------------------------------------------
+
+def detect_gpu_device() -> str:
+    """Detect the GPU device for PyTorch (Kokoro TTS).
+
+    Returns 'cuda' (NVIDIA) or 'mps' (Apple Silicon).
+    Raises RuntimeError if no GPU is available — this server
+    deliberately refuses to run on CPU.
+    """
+    try:
+        import torch
+    except ImportError as e:
+        raise RuntimeError(f"PyTorch is not installed: {e}") from e
+    if torch.cuda.is_available():
+        return "cuda"
+    if platform.system() == "Darwin" and torch.backends.mps.is_available():
+        return "mps"
+    raise RuntimeError(
+        "No GPU detected (CUDA or Metal). This server is GPU-only and "
+        "refuses to run on CPU. Install NVIDIA drivers + a CUDA-enabled "
+        "PyTorch build (or run on Apple Silicon) and restart."
+    )
+
 
 def detect_stt_backend() -> tuple:
-    """Detect available STT backend and return name + loaded model/module.
+    """Detect the GPU STT backend and return (name, model_or_module).
 
-    Priority: CUDA (faster-whisper) > MLX (mlx-whisper) > CPU (faster-whisper).
+    Priority: CUDA (faster-whisper) > MLX (mlx-whisper, Apple Silicon).
+    Raises RuntimeError if no GPU backend is available — no CPU fallback.
     Returns (backend_name, model_or_module).
     """
-    system = platform.system()
-    
-    # Check for CUDA first (NVIDIA GPU)
+    # NVIDIA GPU → faster-whisper (CTranslate2 CUDA)
     try:
         import torch
         if torch.cuda.is_available():
             from faster_whisper import WhisperModel
-            logger.info("CUDA detected — using faster-whisper (CUDA)")
-            return "cuda", WhisperModel(
-                "large-v3",
-                device="cuda",
-                device_index=0,
-                compute_type="float16",
-            )
+            try:
+                logger.info("CUDA detected — using faster-whisper (CUDA)")
+                return "cuda", WhisperModel(
+                    "large-v3",
+                    device="cuda",
+                    device_index=GPU_DEVICE_INDEX,
+                    compute_type="float16",
+                )
+            except Exception as e:
+                err = str(e)
+                hint = (
+                    "The GPU is out of memory — close other GPU workloads "
+                    "and retry."
+                    if "out of memory" in err.lower()
+                    else "The installed ctranslate2 build likely lacks CUDA "
+                    "support (install a CUDA-enabled wheel)."
+                )
+                raise RuntimeError(
+                    f"CUDA is available but faster-whisper failed to load on "
+                    f"GPU: {err} {hint} This server is GPU-only — no CPU "
+                    f"fallback."
+                ) from e
     except ImportError:
         pass
-    
-    # Check for CUDA but not available (NVIDIA driver but no GPU)
-    try:
-        import torch
-        if torch.cuda.is_available():
-            from faster_whisper import WhisperModel
-            return "cuda", WhisperModel(
-                "large-v3",
-                device="cuda",
-                device_index=0,
-                compute_type="float16",
-            )
-    except ImportError:
-        pass
-    
-    # Check for MLX (Apple Silicon)
-    try:
-        import mlx.core as mx
-        if system == "Darwin" and mx.metal.is_available():
-            import mlx_whisper
-            logger.info("Apple Silicon (MPS/MLX) detected — using mlx-whisper")
-            return "mlx", mlx_whisper
-    except ImportError:
-        pass
-    
-    # Check for CUDA availability but CTranslate2 lacks it
-    try:
-        from faster_whisper import WhisperModel
-        import ctranslate2
-        # Try CUDA first
+
+    # Apple Silicon → mlx-whisper (Metal GPU)
+    if platform.system() == "Darwin":
         try:
-            model = WhisperModel("large-v3", device="cuda", device_index=0, compute_type="float16")
-            logger.info("faster-whisper (CUDA) available")
-            return "cuda", model
-        except (ValueError, Exception):
-            logger.info("CTranslate2 lacks CUDA — falling back to CPU")
-            cpu_model = WhisperModel("large-v3", device="cpu", compute_type="int8")
-            return "cpu", cpu_model
-    except ImportError:
-        pass
-    
-    # Default: CPU fallback
-    logger.warning("No GPU/MLX detected — using CPU for STT (slow)")
-    try:
-        from faster_whisper import WhisperModel
-        import ctranslate2
-        return "cpu", WhisperModel("large-v3", device="cpu", compute_type="int8")
-    except ImportError:
-        return "none", None
+            import mlx.core as mx
+            if mx.metal.is_available():
+                import mlx_whisper
+                logger.info("Apple Silicon (Metal/MLX) detected — using mlx-whisper")
+                return "mlx", mlx_whisper
+        except ImportError:
+            pass
+
+    raise RuntimeError(
+        "No GPU available for STT (need NVIDIA CUDA or Apple MLX). "
+        "This server is GPU-only and refuses to run on CPU."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -207,7 +217,7 @@ def transcribe_audio(file_path: str, language: Optional[str] = None) -> tuple:
         }
         return result["text"], info
     
-    elif whisper_backend in ("cuda", "cpu"):
+    elif whisper_backend == "cuda":
         segments, info = whisper_model.transcribe(file_path, language=language)
         text = " ".join(seg.text.strip() for seg in segments)
         info_dict = {
@@ -222,16 +232,20 @@ def transcribe_audio(file_path: str, language: Optional[str] = None) -> tuple:
 
 
 # ---------------------------------------------------------------------------
-# Kokoro pipeline (always PyTorch — works on CPU, MPS, CUDA)
+# Kokoro pipeline (always PyTorch on the GPU — CUDA or MPS)
 # ---------------------------------------------------------------------------
 
 def get_pipeline(lang_code: str):
     """Get or create a Kokoro KPipeline for the given language code."""
     from kokoro import KPipeline
     if lang_code not in pipelines:
-        logger.info(f"Loading KPipeline lang_code='{lang_code}'...")
-        pipelines[lang_code] = KPipeline(lang_code=lang_code)
-        logger.info(f"Pipeline '{lang_code}' ready.")
+        logger.info(f"Loading KPipeline lang_code='{lang_code}' device={TTS_DEVICE}...")
+        pipelines[lang_code] = KPipeline(
+            lang_code=lang_code,
+            repo_id="hexgrad/Kokoro-82M",
+            device=TTS_DEVICE,  # 'cuda' or 'mps' — never 'cpu'
+        )
+        logger.info(f"Pipeline '{lang_code}' ready on {TTS_DEVICE}.")
     return pipelines[lang_code]
 
 
@@ -241,14 +255,23 @@ def get_pipeline(lang_code: str):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Initialize all backends on startup."""
-    # Load Kokoro (always PyTorch)
-    logger.info("Loading Kokoro model (PyTorch)...")
+    """Initialize all backends on startup.
+
+    GPU-only: fails hard (and systemd restarts the unit) if no GPU is
+    available — this server never runs on CPU.
+    """
+    global TTS_DEVICE, whisper_backend, whisper_model, ml_stt
+
+    # Detect GPU up front — fatal if missing (no CPU fallback)
+    TTS_DEVICE = detect_gpu_device()
+    logger.info(f"GPU detected — TTS device: {TTS_DEVICE}")
+
+    # Load Kokoro (PyTorch, pinned to the GPU)
+    logger.info("Loading Kokoro model (PyTorch, %s)...", TTS_DEVICE)
     get_pipeline("a")  # Pre-load American English (most common)
-    logger.info("Kokoro TTS ready.")
-    
-    # Load STT backend (auto-detected)
-    global whisper_backend, whisper_model, ml_stt
+    logger.info("Kokoro TTS ready on %s.", TTS_DEVICE)
+
+    # Load STT backend (GPU — CUDA or MLX, never CPU)
     whisper_backend, loaded = detect_stt_backend()
     if whisper_backend == "mlx":
         ml_stt = loaded
@@ -256,9 +279,9 @@ async def lifespan(app: FastAPI):
         whisper_model = loaded
     logger.info(f"STT backend: {whisper_backend}")
     logger.info("Server ready.")
-    
+
     yield
-    
+
     logger.info("Shutting down.")
 
 
@@ -355,7 +378,7 @@ HOME_PAGE_HTML = """
             const r = await fetch('/health');
             const d = await r.json();
             const modelsTable = document.getElementById('models-table');
-            const statusClass = (s) => s === 'ok' ? 'badge-green' : s === 'none' ? 'badge-red' : 'badge-yellow';
+            const statusClass = (s) => ['cuda', 'mlx', 'ok'].includes(s) ? 'badge-green' : s === 'none' ? 'badge-red' : 'badge-yellow';
             modelsTable.innerHTML = `
                 <tr><th>Model</th><th>Backend</th><th>Device</th><th>Status</th></tr>
                 <tr><td>Kokoro TTS</td><td>${d.tts_backend}</td><td>${d.tts_device}</td><td><span class="badge badge-green">active</span></td></tr>
@@ -521,7 +544,7 @@ async def create_transcription(
     language: Optional[str] = Form(None),
     response_format: str = Form("json"),
 ):
-    if whisper_backend == "none" or whisper_model is None:
+    if whisper_backend == "none" or (whisper_backend == "cuda" and whisper_model is None):
         raise HTTPException(status_code=503, detail=f"STT backend '{whisper_backend}' not loaded.")
     
     suffix = os.path.splitext(file.filename or ".wav")[1]
@@ -591,35 +614,17 @@ async def list_models():
 
 @app.get("/health")
 async def health():
-    """Healthcheck — reports which backends are active."""
+    """Healthcheck — reports which backends are active (real devices)."""
     return {
         "status": "ok",
         "tts_backend": "kokoro-pytorch",
-        "tts_device": "cuda" if _torch_has_cuda() else "mlx" if _mlx_is_available() else "cpu",
+        "tts_device": TTS_DEVICE or "uninitialized",
         "stt_backend": whisper_backend,
         "stt_model": "large-v3",
-        "stt_device": {"cuda": "nvidia-gpu", "mlx": "apple-silicon", "cpu": "cpu", "none": "none"}.get(
+        "stt_device": {"cuda": "nvidia-gpu", "mlx": "apple-silicon"}.get(
             whisper_backend, "unknown"
         ),
     }
-
-
-def _torch_has_cuda():
-    """Check if CUDA is available."""
-    try:
-        import torch
-        return torch.cuda.is_available()
-    except ImportError:
-        return False
-
-
-def _mlx_is_available():
-    """Check if MLX is available (Apple Silicon)."""
-    try:
-        import mlx.core as mx
-        return mx.metal.is_available()
-    except ImportError:
-        return False
 
 
 if __name__ == "__main__":

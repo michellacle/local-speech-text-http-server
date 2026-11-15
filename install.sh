@@ -120,6 +120,7 @@ ExecStart=${VENV_DIR}/bin/python ${INSTALL_DIR}/server.py
 Restart=on-failure
 RestartSec=5
 Environment=PYTHONUNBUFFERED=1
+Environment=PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 Environment=HF_HOME=${HF_CACHE_DIR}
 Environment=HUGGINGFACE_HUB_CACHE=${HF_CACHE_DIR}
 Environment=TORCH_HOME=${HF_CACHE_DIR}/torch
