@@ -436,7 +436,7 @@ HOME_PAGE_HTML = """
             </table>
         </div>
 
-        <div class="card">
+        <div class="card full">
             <h2>GPU Status (nvidia-smi)</h2>
             <button class="refresh-btn" onclick="fetchNvidiaSmi()">Refresh</button>
             <div id="nvidia-smi">Loading...</div>
