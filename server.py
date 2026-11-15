@@ -110,6 +110,16 @@ pipelines: dict = {}
 TTS_DEVICE: str = ""
 GPU_DEVICE_INDEX = int(os.environ.get("GPU_DEVICE_INDEX", "0"))
 
+# Keep interactive transcription responsive. Faster-Whisper defaults to a
+# larger beam than the OpenAI Whisper API, which adds latency for voice input.
+STT_BEAM_SIZE = int(os.environ.get("STT_BEAM_SIZE", "1"))
+STT_VAD_FILTER = os.environ.get("STT_VAD_FILTER", "true").lower() in {
+    "1", "true", "yes", "on"
+}
+STT_CONDITION_ON_PREVIOUS_TEXT = os.environ.get(
+    "STT_CONDITION_ON_PREVIOUS_TEXT", "false"
+).lower() in {"1", "true", "yes", "on"}
+
 # STT backends (populated at startup)
 # On NVIDIA: whisper_model = faster_whisper.WhisperModel (CUDA)
 # On Apple Silicon (MLX): ml_stt = mlx_whisper module
@@ -294,7 +304,13 @@ def transcribe_audio(file_path: str, language: Optional[str] = None) -> tuple:
         return result["text"], info
     
     elif whisper_backend == "cuda":
-        segments, info = whisper_model.transcribe(file_path, language=language)
+        segments, info = whisper_model.transcribe(
+            file_path,
+            language=language,
+            beam_size=STT_BEAM_SIZE,
+            vad_filter=STT_VAD_FILTER,
+            condition_on_previous_text=STT_CONDITION_ON_PREVIOUS_TEXT,
+        )
         text = " ".join(seg.text.strip() for seg in segments)
         info_dict = {
             "language": info.language,
@@ -305,6 +321,40 @@ def transcribe_audio(file_path: str, language: Optional[str] = None) -> tuple:
     
     else:
         raise RuntimeError("No STT backend loaded. Check startup logs.")
+
+
+def warm_up_stt_model() -> None:
+    """Initialize CUDA kernels before the first user transcription."""
+    if whisper_backend != "cuda" or whisper_model is None:
+        return
+
+    warmup_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            warmup_path = tmp.name
+        # A short tone forces the encoder and decoder to execute without
+        # requiring a bundled speech sample or making a network request.
+        sample_rate = 16000
+        samples = 0.01 * np.sin(
+            2 * np.pi * 440 * np.arange(sample_rate, dtype=np.float32) / sample_rate
+        )
+        sf.write(warmup_path, samples, sample_rate)
+        segments, _ = whisper_model.transcribe(
+            warmup_path,
+            language="en",
+            beam_size=STT_BEAM_SIZE,
+            vad_filter=False,
+            condition_on_previous_text=STT_CONDITION_ON_PREVIOUS_TEXT,
+        )
+        for _ in segments:
+            pass
+        logger.info("STT CUDA warm-up complete.")
+    finally:
+        if warmup_path:
+            try:
+                os.unlink(warmup_path)
+            except FileNotFoundError:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -354,6 +404,7 @@ async def lifespan(app: FastAPI):
     else:
         whisper_model = loaded
     logger.info(f"STT backend: {whisper_backend}")
+    warm_up_stt_model()
     logger.info("Server ready.")
 
     yield
